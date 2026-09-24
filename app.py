@@ -27,13 +27,14 @@ DAY_HOURS = {
     "Thursday": list(range(8, 15)),
     "Friday": list(range(8, 13)),
 }
-BATCHES = ["22CE", "23CE", "24CE", "25CE", "26CE"]
-ALL_SECTIONS = ["A", "B", "C", "D"]
+BATCH_SUGGESTIONS = ["22CE", "23CE", "24CE", "25CE", "26CE"]
+SECTION_SUGGESTIONS = ["A", "B", "C", "D"]
 
 
 def allowed_sections(batch):
-    # User's current rule: only 25CE has four sections.
-    return ["A", "B", "C", "D"] if batch == "25CE" else ["A", "B", "C"]
+    # Kept only as suggestions. The coordinator is free to enter
+    # any batch and section manually.
+    return SECTION_SUGGESTIONS
 
 
 def hour_label(h):
@@ -77,11 +78,8 @@ def normalize_allocations(df):
     out["CH"] = pd.to_numeric(out["CH"], errors="coerce").fillna(0).astype(int)
 
     return out[
-        out["Batch"].isin(BATCHES)
-        & out.apply(
-            lambda r: r["Section"] in allowed_sections(r["Batch"]),
-            axis=1,
-        )
+        out["Batch"].ne("")
+        & out["Section"].ne("")
         & out["Subject"].ne("")
         & out["Teacher"].ne("")
         & out["Type"].isin(["Theory", "Practical"])
@@ -96,13 +94,10 @@ def validate_allocations(df):
 
     for i, r in df.iterrows():
         row = i + 1
-        if r["Batch"] not in BATCHES:
-            errors.append(f"Row {row}: invalid batch '{r['Batch']}'.")
-        elif r["Section"] not in allowed_sections(r["Batch"]):
-            errors.append(
-                f"Row {row}: {r['Batch']} does not have Section {r['Section']}. "
-                f"Allowed sections: {', '.join(allowed_sections(r['Batch']))}."
-            )
+        if not r["Batch"]:
+            errors.append(f"Row {row}: batch is missing.")
+        if not r["Section"]:
+            errors.append(f"Row {row}: section is missing.")
         if not r["Subject"]:
             errors.append(f"Row {row}: subject is missing.")
         if not r["Teacher"]:
@@ -314,11 +309,11 @@ def create_manual_locks(lock_df):
         except Exception:
             start = 0
 
-        if batch not in BATCHES:
-            errors.append(f"Lock row {row}: invalid batch.")
+        if not batch:
+            errors.append(f"Lock row {row}: batch is required.")
             continue
-        if section not in allowed_sections(batch):
-            errors.append(f"Lock row {row}: Section {section} is not valid for {batch}.")
+        if not section:
+            errors.append(f"Lock row {row}: section is required.")
             continue
         if day not in DAYS:
             errors.append(f"Lock row {row}: invalid day.")
@@ -658,11 +653,11 @@ with tab1:
     st.info(
         "Enter one row for each teaching assignment. "
         "For a subject with theory and practical, use separate rows. "
-        "Only 25CE currently allows Section D; all other batches use A, B and C."
+        "Batch and section are open-entry fields. Type the exact batch/section used by your department (e.g. 22CE-D)."
     )
 
     c1, c2, c3 = st.columns(3)
-    batch = c1.selectbox("Batch", BATCHES)
+    batch = c1.selectbox("Batch", BATCH_SUGGESTIONS)
     section = c2.selectbox("Section", allowed_sections(batch))
     typ = c3.selectbox("Type", ["Theory", "Practical"])
 
@@ -707,10 +702,8 @@ with tab1:
         hide_index=True,
         num_rows="dynamic",
         column_config={
-            "Batch": st.column_config.SelectboxColumn("Batch", options=BATCHES),
-            "Section": st.column_config.SelectboxColumn(
-                "Section", options=ALL_SECTIONS
-            ),
+            "Batch": st.column_config.TextColumn("Batch"),
+            "Section": st.column_config.TextColumn("Section"),
             "Type": st.column_config.SelectboxColumn(
                 "Type", options=["Theory", "Practical"]
             ),
@@ -746,12 +739,18 @@ with tab2:
         "day/time. These slots are locked and the automatic scheduler works around them."
     )
 
-    fixed_batch = st.selectbox("Batch for fixed slot", BATCHES, key="fixed_batch")
-    fixed_section = st.selectbox(
+    fixed_batch = st.text_input(
+        "Batch for fixed slot",
+        placeholder="e.g. 22CE",
+        key="fixed_batch",
+    )
+    fixed_section = st.text_input(
         "Section for fixed slot",
-        allowed_sections(fixed_batch),
+        placeholder="e.g. A",
         key="fixed_section",
     )
+    if not fixed_batch:
+        st.caption("Common batch examples: " + ", ".join(BATCH_SUGGESTIONS))
 
     c1, c2, c3 = st.columns(3)
     fixed_day = c1.selectbox("Day", DAYS)
@@ -896,8 +895,10 @@ with tab4:
         )
 
         st.markdown("### Timetable by Batch / Section")
-        for batch in BATCHES:
-            for section in allowed_sections(batch):
+        result_batches = sorted({x["batch"] for x in schedule})
+        for batch in result_batches:
+            result_sections = sorted({x["section"] for x in schedule if x["batch"] == batch})
+            for section in result_sections:
                 st.markdown(f"#### {batch} — Section {section}")
                 st.dataframe(
                     timetable_grid(schedule, batch, section),
