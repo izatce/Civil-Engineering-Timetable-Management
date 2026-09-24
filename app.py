@@ -657,9 +657,22 @@ with tab1:
     )
 
     c1, c2, c3 = st.columns(3)
-    batch = c1.selectbox("Batch", BATCH_SUGGESTIONS)
-    section = c2.selectbox("Section", allowed_sections(batch))
+    batch = c1.text_input(
+        "Batch",
+        placeholder="e.g. 22CE, 23CE, 27CE, MSc-1, etc.",
+        help="Open entry: type any batch name/code. It is not limited to a predefined list."
+    )
+    section = c2.text_input(
+        "Section",
+        placeholder="e.g. A, B, C, D, E",
+        help="Open entry: type any section label required by your department."
+    )
     typ = c3.selectbox("Type", ["Theory", "Practical"])
+
+    st.caption(
+        "Common examples: " + ", ".join(BATCH_SUGGESTIONS) +
+        " — these are only examples; you can enter any batch."
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     subject = c1.text_input("Subject")
@@ -750,7 +763,7 @@ with tab2:
         key="fixed_section",
     )
     if not fixed_batch:
-        st.caption("Common batch examples: " + ", ".join(BATCH_SUGGESTIONS))
+        st.caption("Common examples: " + ", ".join(BATCH_SUGGESTIONS) + " — custom batches are also allowed.")
 
     c1, c2, c3 = st.columns(3)
     fixed_day = c1.selectbox("Day", DAYS)
