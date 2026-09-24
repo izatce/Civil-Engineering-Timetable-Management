@@ -32,6 +32,12 @@ HOURS = {
 }
 SECTIONS = ["A", "B", "C", "D"]
 
+# Section structure used by the Civil Engineering allocation:
+# 25CE is the only batch with four sections (A-D).
+# All other CE batches have only three sections (A-C).
+def sections_for_batch(batch):
+    return ["A", "B", "C", "D"] if canon_batch(batch) == "25CE" else ["A", "B", "C"]
+
 
 # -------------------------------------------------------------------
 # General helpers
@@ -402,24 +408,33 @@ def parse_upload(upload):
 # -------------------------------------------------------------------
 # Convert allocation into section-specific teaching requirements
 # -------------------------------------------------------------------
-def expand_records(rows, sections):
+def expand_records(rows, selected_sections):
     records = []
 
     for r in rows:
         if not is_civil_row(r):
             continue
 
+        batch = canon_batch(r["batch"])
+        # IMPORTANT: The allocation's final column is the practical teacher;
+        # it is NOT a fourth section. Only 25CE has Section D.
+        valid_sections = sections_for_batch(batch)
+        sections = [s for s in selected_sections if s in valid_sections]
+
         for sec in sections:
-            idx = SECTIONS.index(sec)
+            idx = ["A", "B", "C", "D"].index(sec)
             theory_teachers = r.get("theory_teachers", [])
             teacher = clean(theory_teachers[idx]) if idx < len(theory_teachers) else ""
             practical_teacher = clean(r.get("practical_teacher", ""))
 
             # Theory: one-hour periods. A 3+1 subject needs 3 theory periods/week.
+            # A blank Theory teacher means no theory class is created for that section.
             for n in range(int(r.get("theory_hours", 0) or 0)):
+                if is_na_teacher(teacher):
+                    continue
                 records.append(
                     {
-                        "batch": canon_batch(r["batch"]),
+                        "batch": batch,
                         "section": sec,
                         "subject": r["subject"],
                         "code": r["code"],
@@ -429,11 +444,13 @@ def expand_records(rows, sections):
                     }
                 )
 
-            # Practical: user's rule is one continuous 3-hour block/week.
+            # Practical: the teacher comes from the LAST/PRACTICAL column.
+            # It is applied to each real section of the batch, but never to a
+            # non-existent Section D for 22CE/23CE/24CE/26CE/etc.
             if int(r.get("practical_hours", 0) or 0) > 0 and not is_na_teacher(practical_teacher):
                 records.append(
                     {
-                        "batch": canon_batch(r["batch"]),
+                        "batch": batch,
                         "section": sec,
                         "subject": r["subject"],
                         "code": r["code"],
@@ -802,10 +819,16 @@ if upload:
     st.subheader("2. Select batches and sections")
     c1, c2 = st.columns(2)
     selected_batches = c1.multiselect("Batches", batches, default=batches)
+
+    available_sections = sorted(
+        {sec for batch in selected_batches for sec in sections_for_batch(batch)},
+        key=lambda x: ["A", "B", "C", "D"].index(x),
+    )
     selected_sections = c2.multiselect(
         "Sections",
-        SECTIONS,
-        default=["A", "B", "C", "D"],
+        available_sections,
+        default=available_sections,
+        help="A-C are available for all CE batches. Section D is available only for 25CE.",
     )
 
     st.subheader("3. Optional manual teacher/time locks")
@@ -823,7 +846,7 @@ if upload:
         num_rows="dynamic",
         column_config={
             "Batch": st.column_config.SelectboxColumn("Batch", options=selected_batches),
-            "Section": st.column_config.SelectboxColumn("Section", options=SECTIONS),
+            "Section": st.column_config.SelectboxColumn("Section", options=available_sections),
             "Day": st.column_config.SelectboxColumn("Day", options=DAYS),
             "Start": st.column_config.NumberColumn("Start hour", min_value=8, max_value=14, step=1),
             "Type": st.column_config.SelectboxColumn("Type", options=["Theory", "Practical"]),
