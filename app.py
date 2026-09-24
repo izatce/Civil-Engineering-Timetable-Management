@@ -1,557 +1,242 @@
+
 import io
-import re
 from collections import defaultdict
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
-
-try:
-    from docx import Document
-except ImportError:
-    Document = None
-
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+from docx.shared import Inches, Pt
 
 st.set_page_config(
-    page_title="Civil Engineering Timetable Planner",
-    page_icon="🗓️",
+    page_title="CivTime - Civil Engineering Timetable Coordinator",
+    page_icon="📅",
     layout="wide",
 )
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
-HOURS = {
+DAY_HOURS = {
     "Monday": list(range(8, 15)),
     "Tuesday": list(range(8, 15)),
     "Wednesday": list(range(8, 15)),
     "Thursday": list(range(8, 15)),
     "Friday": list(range(8, 13)),
 }
-SECTIONS = ["A", "B", "C", "D"]
-
-# Section structure used by the Civil Engineering allocation:
-# 25CE is the only batch with four sections (A-D).
-# All other CE batches have only three sections (A-C).
-def sections_for_batch(batch):
-    return ["A", "B", "C", "D"] if canon_batch(batch) == "25CE" else ["A", "B", "C"]
+BATCHES = ["22CE", "23CE", "24CE", "25CE", "26CE"]
+ALL_SECTIONS = ["A", "B", "C", "D"]
 
 
-# -------------------------------------------------------------------
-# General helpers
-# -------------------------------------------------------------------
-def clean(x):
-    if x is None:
-        return ""
-    return re.sub(r"\s+", " ", str(x).replace("\xa0", " ").replace("\n", " ")).strip()
+def allowed_sections(batch):
+    # User's current rule: only 25CE has four sections.
+    return ["A", "B", "C", "D"] if batch == "25CE" else ["A", "B", "C"]
 
 
-def canon_batch(x):
-    return re.sub(r"[^0-9A-Z]", "", clean(x).upper())
+def hour_label(h):
+    return f"{h:02d}:00-{h+1:02d}:00"
 
 
-def subject_code(x):
-    m = re.search(r"\(([A-Z]{2,8}\d{2,5})\)", clean(x).upper())
-    return m.group(1) if m else ""
-
-
-def parse_subject_cell(x):
-    s = clean(x)
-    m = re.search(
-        r"^(.*?)\s*\(([A-Z]{2,8}\d{2,5})\)\s*(\d+)\s*\+\s*(\d+)",
-        s,
-        re.I,
-    )
-    if not m:
-        return None
-    return {
-        "subject": clean(m.group(1)),
-        "code": m.group(2).upper(),
-        "theory": int(m.group(3)),
-        "practical": int(m.group(4)),
-    }
-
-
-def is_na_teacher(x):
-    s = clean(x).lower()
-    return s in {"", "n.a", "n.a.", "na", "-", "—", "none", "cell", "bsrs"}
-
-
-def is_civil_row(row):
-    # The supplied allocation document has a separate final block for
-    # subjects taught in other departments. Those rows are never imported.
-    if row.get("other_department"):
-        return False
-    return clean(row.get("code", "")).upper().startswith("CE")
-
-
-def detect_batch(text):
-    t = clean(text).upper()
-    m = re.search(r"\b(2[2-6])\s*[- ]?\s*CE\s*(?:BATCH)?\b", t)
-    return canon_batch(m.group(1) + "CE") if m else ""
-
-
-def detect_semester(text):
-    m = re.search(r"\b(\d+)\s*(?:ST|ND|RD|TH)\s+SEMESTER\b", clean(text).upper())
-    return int(m.group(1)) if m else ""
-
-
-# -------------------------------------------------------------------
-# File readers
-# -------------------------------------------------------------------
-def read_pdf(upload):
-    if pdfplumber is None:
-        raise RuntimeError("pdfplumber is missing.")
-    upload.seek(0)
-    pages = []
-    with pdfplumber.open(upload) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(x_tolerance=2, y_tolerance=3) or ""
-            tables = []
-            for settings in (
-                {"vertical_strategy": "lines", "horizontal_strategy": "lines"},
-                {"vertical_strategy": "text", "horizontal_strategy": "text"},
-            ):
-                try:
-                    tables = page.extract_tables(settings) or []
-                except Exception:
-                    tables = []
-                if tables:
-                    break
-            pages.append({"text": text, "tables": tables})
-    return pages
-
-
-def read_docx(upload):
-    if Document is None:
-        raise RuntimeError("python-docx is missing.")
-    upload.seek(0)
-    doc = Document(upload)
-    tables = []
-    for table in doc.tables:
-        tables.append([[clean(c.text) for c in row.cells] for row in table.rows])
-    paragraphs = [clean(p.text) for p in doc.paragraphs if clean(p.text)]
-    return tables, paragraphs
-
-
-def read_excel(upload):
-    upload.seek(0)
-    return pd.read_excel(upload, sheet_name=None)
-
-
-# -------------------------------------------------------------------
-# Allocation parsing
-# -------------------------------------------------------------------
-def parse_structured_table(table, context_text=""):
-    """Parse a normal Subject / Theory A-D / Practical table."""
-    if not table:
-        return []
-
-    out = []
-    header = [clean(v).lower() for v in table[0]]
-    # Find likely subject column.
-    subject_col = next(
-        (i for i, h in enumerate(header) if "subject" in h),
-        0,
+def empty_allocations():
+    return pd.DataFrame(
+        columns=[
+            "Batch", "Section", "Subject", "Code",
+            "Teacher", "Type", "CH"
+        ]
     )
 
-    batch = detect_batch(context_text)
-    semester = detect_semester(context_text)
 
-    for row in table[1:] if len(table) > 1 else []:
-        vals = [clean(v) for v in row]
-        joined = " | ".join(vals)
+def empty_locks():
+    return pd.DataFrame(
+        columns=[
+            "Batch", "Section", "Day", "Start",
+            "Subject", "Code", "Teacher", "Type"
+        ]
+    )
 
-        if "SUBJECTS TO BE TAUGHT IN OTHER DEPARTMENTS" in joined.upper():
-            break
 
-        parsed = None
-        parsed_idx = None
-        for i, v in enumerate(vals):
-            p = parse_subject_cell(v)
-            if p:
-                parsed = p
-                parsed_idx = i
-                break
+def normalize_allocations(df):
+    if df is None or df.empty:
+        return empty_allocations()
 
-        if not parsed:
-            # Sometimes subject/code/CH are split across cells.
-            p = parse_subject_cell(joined.replace(" | ", " "))
-            if p:
-                parsed = p
-                parsed_idx = subject_col
+    out = df.copy()
+    for c in empty_allocations().columns:
+        if c not in out.columns:
+            out[c] = ""
 
-        if not parsed:
-            continue
+    out = out[empty_allocations().columns].copy()
+    out["Batch"] = out["Batch"].astype(str).str.strip().str.upper()
+    out["Section"] = out["Section"].astype(str).str.strip().str.upper()
+    out["Subject"] = out["Subject"].astype(str).str.strip()
+    out["Code"] = out["Code"].astype(str).str.strip().str.upper()
+    out["Teacher"] = out["Teacher"].astype(str).str.strip()
+    out["Type"] = out["Type"].astype(str).str.strip().str.title()
+    out["CH"] = pd.to_numeric(out["CH"], errors="coerce").fillna(0).astype(int)
 
-        after = vals[(parsed_idx or 0) + 1 :]
-        # Expected layout after subject: Theory A, B, C, optional D, Practical.
-        while len(after) < 5:
-            after.append("")
-
-        practical = after[-1]
-        theories = after[:-1][:4]
-
-        out.append(
-            {
-                "batch": batch,
-                "semester": semester,
-                "subject": parsed["subject"],
-                "code": parsed["code"],
-                "theory_hours": parsed["theory"],
-                "practical_hours": parsed["practical"],
-                "theory_teachers": theories,
-                "practical_teacher": practical,
-                "other_department": False,
-            }
+    return out[
+        out["Batch"].isin(BATCHES)
+        & out.apply(
+            lambda r: r["Section"] in allowed_sections(r["Batch"]),
+            axis=1,
         )
-    return out
+        & out["Subject"].ne("")
+        & out["Teacher"].ne("")
+        & out["Type"].isin(["Theory", "Practical"])
+        & out["CH"].gt(0)
+    ].reset_index(drop=True)
 
 
-def parse_text_blocks(text):
-    """
-    Fallback parser for PDFs/DOCX where table extraction loses the merged
-    cells. It uses batch headings and subject-code lines, then reads the
-    following teacher lines conservatively.
-    """
-    lines = [clean(x) for x in text.splitlines() if clean(x)]
-    rows = []
-    current_batch = ""
-    current_sem = ""
-    current = None
-    teacher_lines = []
-    other_department = False
+def validate_allocations(df):
+    errors = []
+    if df.empty:
+        return errors
 
-    def finish():
-        nonlocal current, teacher_lines
-        if not current:
-            return
-        t = [clean(x) for x in teacher_lines if clean(x)]
-        while len(t) < 5:
-            t.append("")
-        rows.append(
-            {
-                "batch": current_batch,
-                "semester": current_sem,
-                "subject": current["subject"],
-                "code": current["code"],
-                "theory_hours": current["theory"],
-                "practical_hours": current["practical"],
-                "theory_teachers": t[:4],
-                "practical_teacher": t[4],
-                "other_department": other_department,
-            }
-        )
-        current = None
-        teacher_lines = []
-
-    for line in lines:
-        if "SUBJECTS TO BE TAUGHT IN OTHER DEPARTMENTS" in line.upper():
-            finish()
-            other_department = True
-            continue
-        if other_department:
-            continue
-
-        b = detect_batch(line)
-        if b:
-            finish()
-            current_batch = b
-            continue
-
-        s = detect_semester(line)
-        if s:
-            current_sem = s
-            continue
-
-        p = parse_subject_cell(line)
-        if p:
-            finish()
-            current = p
-            teacher_lines = []
-            continue
-
-        if current:
-            # Accept typical teacher-name lines, but ignore table labels.
-            if re.search(r"\b(Prof|Dr|Engr|Mr|Ms)\b", line, re.I):
-                teacher_lines.append(line)
-
-    finish()
-    return rows
-
-
-def dedupe(rows):
-    seen = set()
-    result = []
-    for r in rows:
-        key = (
-            canon_batch(r.get("batch")),
-            clean(r.get("code")).upper(),
-            clean(r.get("subject")).lower(),
-            str(r.get("semester")),
-        )
-        if not key[1] or key in seen:
-            continue
-        seen.add(key)
-        result.append(r)
-    return result
-
-
-def parse_pdf(upload):
-    pages = read_pdf(upload)
-    all_rows = []
-
-    # First use page-level table extraction because the allocation document
-    # has explicit Subject / Theory A-D / Practical columns.
-    for page in pages:
-        page_text = page["text"]
-        for table in page["tables"]:
-            all_rows.extend(parse_structured_table(table, page_text))
-
-    all_rows = dedupe(all_rows)
-
-    # If table extraction failed, use the text fallback.
-    if not all_rows:
-        all_rows = parse_text_blocks("\n".join(p["text"] for p in pages))
-
-    return dedupe(all_rows)
-
-
-def parse_docx(upload):
-    tables, paragraphs = read_docx(upload)
-    rows = []
-    paragraph_text = "\n".join(paragraphs)
-
-    for table in tables:
-        rows.extend(parse_structured_table(table, paragraph_text))
-
-    if not rows:
-        rows = parse_text_blocks(paragraph_text)
-
-    return dedupe(rows)
-
-
-def parse_excel(upload):
-    sheets = read_excel(upload)
-    rows = []
-
-    for sheet_name, df in sheets.items():
-        df = df.fillna("")
-        text = "\n".join(" ".join(clean(v) for v in row.tolist()) for _, row in df.iterrows())
-
-        if "SUBJECTS TO BE TAUGHT IN OTHER DEPARTMENTS" in text.upper():
-            text = text.split("SUBJECTS TO BE TAUGHT IN OTHER DEPARTMENTS", 1)[0]
-
-        # Excel files vary considerably, so use row-level parsing.
-        current_batch = ""
-        current_sem = ""
-        for _, row in df.iterrows():
-            vals = [clean(v) for v in row.tolist()]
-            joined = " | ".join(vals)
-
-            b = detect_batch(joined)
-            if b:
-                current_batch = b
-            s = detect_semester(joined)
-            if s:
-                current_sem = s
-
-            parsed = None
-            idx = None
-            for i, v in enumerate(vals):
-                p = parse_subject_cell(v)
-                if p:
-                    parsed, idx = p, i
-                    break
-
-            if not parsed:
-                p = parse_subject_cell(joined.replace(" | ", " "))
-                if p:
-                    parsed, idx = p, 0
-
-            if not parsed:
-                continue
-
-            after = vals[(idx or 0) + 1 :]
-            while len(after) < 5:
-                after.append("")
-            rows.append(
-                {
-                    "batch": current_batch,
-                    "semester": current_sem,
-                    "subject": parsed["subject"],
-                    "code": parsed["code"],
-                    "theory_hours": parsed["theory"],
-                    "practical_hours": parsed["practical"],
-                    "theory_teachers": after[:-1][:4],
-                    "practical_teacher": after[-1],
-                    "other_department": False,
-                }
+    for i, r in df.iterrows():
+        row = i + 1
+        if r["Batch"] not in BATCHES:
+            errors.append(f"Row {row}: invalid batch '{r['Batch']}'.")
+        elif r["Section"] not in allowed_sections(r["Batch"]):
+            errors.append(
+                f"Row {row}: {r['Batch']} does not have Section {r['Section']}. "
+                f"Allowed sections: {', '.join(allowed_sections(r['Batch']))}."
             )
+        if not r["Subject"]:
+            errors.append(f"Row {row}: subject is missing.")
+        if not r["Teacher"]:
+            errors.append(f"Row {row}: teacher is missing.")
+        if r["Type"] not in ["Theory", "Practical"]:
+            errors.append(f"Row {row}: Type must be Theory or Practical.")
+        if int(r["CH"]) <= 0:
+            errors.append(f"Row {row}: CH must be greater than zero.")
 
-    return dedupe(rows)
+        if r["Type"] == "Practical" and int(r["CH"]) != 1:
+            errors.append(
+                f"Row {row}: Practical CH should be 1 under the current timetable rule."
+            )
+        if r["Type"] == "Theory" and int(r["CH"]) > 3:
+            errors.append(
+                f"Row {row}: Theory CH above 3 may require a special rule."
+            )
+    return errors
 
 
-def parse_upload(upload):
-    name = upload.name.lower()
-    if name.endswith(".pdf"):
-        return parse_pdf(upload)
-    if name.endswith(".docx"):
-        return parse_docx(upload)
-    if name.endswith((".xlsx", ".xls", ".xlsm")):
-        return parse_excel(upload)
-    raise ValueError("Use PDF, DOCX, XLSX, XLS or XLSM.")
-
-
-# -------------------------------------------------------------------
-# Convert allocation into section-specific teaching requirements
-# -------------------------------------------------------------------
-def expand_records(rows, selected_sections):
+def records_from_allocations(df):
     records = []
+    for _, r in df.iterrows():
+        base = {
+            "batch": r["Batch"],
+            "section": r["Section"],
+            "subject": r["Subject"],
+            "code": r["Code"],
+            "teacher": r["Teacher"],
+            "type": r["Type"],
+        }
 
-    for r in rows:
-        if not is_civil_row(r):
-            continue
-
-        batch = canon_batch(r["batch"])
-        # IMPORTANT: The allocation's final column is the practical teacher;
-        # it is NOT a fourth section. Only 25CE has Section D.
-        valid_sections = sections_for_batch(batch)
-        sections = [s for s in selected_sections if s in valid_sections]
-
-        for sec in sections:
-            idx = ["A", "B", "C", "D"].index(sec)
-            theory_teachers = r.get("theory_teachers", [])
-            teacher = clean(theory_teachers[idx]) if idx < len(theory_teachers) else ""
-            practical_teacher = clean(r.get("practical_teacher", ""))
-
-            # Theory: one-hour periods. A 3+1 subject needs 3 theory periods/week.
-            # A blank Theory teacher means no theory class is created for that section.
-            for n in range(int(r.get("theory_hours", 0) or 0)):
-                if is_na_teacher(teacher):
-                    continue
-                records.append(
-                    {
-                        "batch": batch,
-                        "section": sec,
-                        "subject": r["subject"],
-                        "code": r["code"],
-                        "teacher": teacher,
-                        "type": "Theory",
-                        "period_no": n + 1,
-                    }
-                )
-
-            # Practical: the teacher comes from the LAST/PRACTICAL column.
-            # It is applied to each real section of the batch, but never to a
-            # non-existent Section D for 22CE/23CE/24CE/26CE/etc.
-            if int(r.get("practical_hours", 0) or 0) > 0 and not is_na_teacher(practical_teacher):
-                records.append(
-                    {
-                        "batch": batch,
-                        "section": sec,
-                        "subject": r["subject"],
-                        "code": r["code"],
-                        "teacher": practical_teacher,
-                        "type": "Practical",
-                        "period_no": 1,
-                    }
-                )
+        if r["Type"] == "Practical":
+            records.append({**base, "length": 3})
+        else:
+            for n in range(int(r["CH"])):
+                records.append({**base, "length": 1, "period_no": n + 1})
 
     return records
 
 
-# -------------------------------------------------------------------
-# Timetable solver
-# -------------------------------------------------------------------
-def teacher_busy(schedule, teacher, day, start):
-    if is_na_teacher(teacher):
-        return False
-    return any(
-        x["teacher"] == teacher and x["day"] == day and x["start"] == start
-        for x in schedule
-    )
-
-
-def section_busy(schedule, batch, section, day, start):
-    return any(
-        x["batch"] == batch
+def occupied(schedule, batch, section, day, start):
+    return [
+        x for x in schedule
+        if x["batch"] == batch
         and x["section"] == section
         and x["day"] == day
         and x["start"] == start
-        for x in schedule
-    )
+    ]
 
 
-def same_subject_same_day(schedule, batch, section, code, day):
-    return any(
-        x["batch"] == batch
-        and x["section"] == section
-        and x["code"] == code
+def teacher_occupied(schedule, teacher, day, start):
+    return [
+        x for x in schedule
+        if x["teacher"].strip().lower() == teacher.strip().lower()
         and x["day"] == day
+        and x["start"] == start
+    ]
+
+
+def subject_on_day(schedule, batch, section, code, subject, day):
+    return [
+        x for x in schedule
+        if x["batch"] == batch
+        and x["section"] == section
+        and x["day"] == day
+        and x["code"].strip().upper() == code.strip().upper()
+        and x["subject"].strip().lower() == subject.strip().lower()
         and x["type"] == "Theory"
-        for x in schedule
-    )
+    ]
 
 
-def day_load(schedule, batch, section, day):
-    return sum(
-        1
+def compactness_score(schedule, batch, section, day, start, length):
+    starts = sorted(
+        x["start"]
         for x in schedule
-        if x["batch"] == batch and x["section"] == section and x["day"] == day
+        if x["batch"] == batch
+        and x["section"] == section
+        and x["day"] == day
     )
+    if not starts:
+        score = 0
+    else:
+        lo, hi = min(starts), max(starts)
+        score = 0
+        if start == hi + 1:
+            score -= 80
+        elif start + length - 1 == lo - 1:
+            score -= 60
+        elif start > lo and start <= hi:
+            score += 500
+
+    # Prefer earlier completion; Friday has less available time.
+    score += start * 2
+    if day == "Friday":
+        score += 40
+    return score
 
 
 def place_practical(schedule, r):
     candidates = []
 
     for day in DAYS:
-        hs = HOURS[day]
-        for i in range(len(hs) - 2):
-            block = [hs[i], hs[i + 1], hs[i + 2]]
+        hours = DAY_HOURS[day]
+        for i in range(len(hours) - 2):
+            start = hours[i]
+            block = [start, start + 1, start + 2]
 
-            # Friday has only 08-13.
-            if any(section_busy(schedule, r["batch"], r["section"], day, h) for h in block):
+            if any(
+                occupied(schedule, r["batch"], r["section"], day, h)
+                for h in block
+            ):
                 continue
-            if any(teacher_busy(schedule, r["teacher"], day, h) for h in block):
+            if any(teacher_occupied(schedule, r["teacher"], day, h) for h in block):
                 continue
 
-            score = block[0]
-            if day == "Friday":
-                score += 80
-
-            # Prefer a block adjacent to existing classes rather than
-            # creating an isolated late period.
-            existing = sorted(
-                x["start"]
-                for x in schedule
-                if x["batch"] == r["batch"]
-                and x["section"] == r["section"]
-                and x["day"] == day
+            score = compactness_score(
+                schedule, r["batch"], r["section"], day, start, 3
             )
-            if existing:
-                if block[0] == max(existing) + 1:
-                    score -= 40
-                if block[-1] == min(existing) - 1:
-                    score -= 30
-
-            candidates.append((score, day, block[0]))
+            candidates.append((score, day, start))
 
     if not candidates:
         return False
 
     _, day, start = min(candidates)
-    for h in [start, start + 1, start + 2]:
-        schedule.append(
-            {
-                **r,
-                "day": day,
-                "start": h,
-                "end": h + 1,
-            }
-        )
+
+    for j in range(3):
+        schedule.append({
+            **r,
+            "day": day,
+            "start": start + j,
+            "end": start + j + 1,
+            "block_id": f"{r['batch']}-{r['section']}-{r['code']}-PR-{day}-{start}",
+        })
     return True
 
 
@@ -559,50 +244,36 @@ def place_theory(schedule, r):
     candidates = []
 
     for day in DAYS:
-        for start in HOURS[day]:
-            if section_busy(schedule, r["batch"], r["section"], day, start):
+        for start in DAY_HOURS[day]:
+            if occupied(schedule, r["batch"], r["section"], day, start):
                 continue
-            if teacher_busy(schedule, r["teacher"], day, start):
+            if teacher_occupied(schedule, r["teacher"], day, start):
                 continue
 
-            # Strong rule: no two theory periods of the same subject on one day.
-            if same_subject_same_day(
-                schedule, r["batch"], r["section"], r["code"], day
+            # Never put the same theory subject twice on the same day.
+            if subject_on_day(
+                schedule, r["batch"], r["section"],
+                r["code"], r["subject"], day
             ):
                 continue
 
-            score = start
-
-            # Prefer not to use Friday unless necessary.
-            if day == "Friday":
-                score += 100
-
-            # Prefer compact daily schedules and avoid holes.
-            starts = sorted(
-                x["start"]
-                for x in schedule
-                if x["batch"] == r["batch"]
-                and x["section"] == r["section"]
-                and x["day"] == day
+            score = compactness_score(
+                schedule, r["batch"], r["section"], day, start, 1
             )
-            if starts:
-                lo, hi = min(starts), max(starts)
-                if start == hi + 1 or start == lo - 1:
-                    score -= 50
-                elif lo < start < hi:
-                    score += 300
 
-            # Spread a subject across different days.
+            # Spread theory classes through the week.
             used_days = {
                 x["day"]
                 for x in schedule
                 if x["batch"] == r["batch"]
                 and x["section"] == r["section"]
-                and x["code"] == r["code"]
+                and x["code"].strip().upper() == r["code"].strip().upper()
                 and x["type"] == "Theory"
             }
             if day in used_days:
-                score += 200
+                score += 300
+            else:
+                score -= 30
 
             candidates.append((score, day, start))
 
@@ -610,35 +281,123 @@ def place_theory(schedule, r):
         return False
 
     _, day, start = min(candidates)
-    schedule.append(
-        {
-            **r,
-            "day": day,
-            "start": start,
-            "end": start + 1,
-        }
-    )
+
+    schedule.append({
+        **r,
+        "day": day,
+        "start": start,
+        "end": start + 1,
+        "block_id": f"{r['batch']}-{r['section']}-{r['code']}-TH-{day}-{start}",
+    })
     return True
 
 
-def generate_timetable(records, locks):
-    schedule = []
+def create_manual_locks(lock_df):
+    locks = []
+    errors = []
 
-    # Fixed manual entries are inserted first and remain unchanged.
-    for lock in locks:
-        schedule.append(lock)
+    if lock_df is None or lock_df.empty:
+        return locks, errors
 
+    for i, r in lock_df.iterrows():
+        row = i + 1
+        batch = str(r.get("Batch", "")).strip().upper()
+        section = str(r.get("Section", "")).strip().upper()
+        day = str(r.get("Day", "")).strip()
+        subject = str(r.get("Subject", "")).strip()
+        code = str(r.get("Code", "")).strip().upper()
+        teacher = str(r.get("Teacher", "")).strip()
+        typ = str(r.get("Type", "")).strip().title()
+
+        try:
+            start = int(r.get("Start", 0))
+        except Exception:
+            start = 0
+
+        if batch not in BATCHES:
+            errors.append(f"Lock row {row}: invalid batch.")
+            continue
+        if section not in allowed_sections(batch):
+            errors.append(f"Lock row {row}: Section {section} is not valid for {batch}.")
+            continue
+        if day not in DAYS:
+            errors.append(f"Lock row {row}: invalid day.")
+            continue
+        if typ not in ["Theory", "Practical"]:
+            errors.append(f"Lock row {row}: Type must be Theory or Practical.")
+            continue
+        if start not in DAY_HOURS[day]:
+            errors.append(f"Lock row {row}: invalid start time for {day}.")
+            continue
+        if not teacher:
+            errors.append(f"Lock row {row}: teacher is required.")
+            continue
+
+        length = 3 if typ == "Practical" else 1
+        if any(h not in DAY_HOURS[day] for h in range(start, start + length)):
+            errors.append(
+                f"Lock row {row}: {typ} does not fit completely on {day}."
+            )
+            continue
+
+        for j in range(length):
+            locks.append({
+                "batch": batch,
+                "section": section,
+                "subject": subject or "Manual class",
+                "code": code,
+                "teacher": teacher,
+                "type": typ,
+                "day": day,
+                "start": start + j,
+                "end": start + j + 1,
+                "block_id": f"LOCK-{row}",
+                "locked": True,
+            })
+
+    return locks, errors
+
+
+def validate_locks(locks):
+    errors = []
+    seen_section = set()
+    seen_teacher = set()
+
+    for x in locks:
+        s_key = (x["batch"], x["section"], x["day"], x["start"])
+        t_key = (x["teacher"].lower(), x["day"], x["start"])
+
+        if s_key in seen_section:
+            errors.append(
+                f"Manual clash: {x['batch']}-{x['section']} has two fixed classes "
+                f"at {x['day']} {hour_label(x['start'])}."
+            )
+        seen_section.add(s_key)
+
+        if t_key in seen_teacher:
+            errors.append(
+                f"Manual teacher clash: {x['teacher']} has two fixed classes "
+                f"at {x['day']} {hour_label(x['start'])}."
+            )
+        seen_teacher.add(t_key)
+
+    return errors
+
+
+def generate(records, locks):
+    schedule = list(locks)
+    failed = []
+
+    # Hardest constraints first.
     practicals = [r for r in records if r["type"] == "Practical"]
     theories = [r for r in records if r["type"] == "Theory"]
 
-    # Practical first because the 3-hour continuity constraint is strongest.
-    failed = []
     for r in practicals:
         if not place_practical(schedule, r):
             failed.append(r)
 
-    # More constrained teachers first.
-    theories.sort(key=lambda x: (is_na_teacher(x["teacher"]), x["batch"], x["section"], x["code"]))
+    # Put subjects with more hours first.
+    theories.sort(key=lambda x: (-int(x.get("length", 1)), x["batch"], x["section"]))
 
     for r in theories:
         if not place_theory(schedule, r):
@@ -647,338 +406,521 @@ def generate_timetable(records, locks):
     return schedule, failed
 
 
-# -------------------------------------------------------------------
-# Validation and output
-# -------------------------------------------------------------------
-def conflicts(schedule):
-    out = []
-    teacher_map = defaultdict(list)
-    section_map = defaultdict(list)
+def clash_report(schedule):
+    clashes = []
+    section_seen = defaultdict(list)
+    teacher_seen = defaultdict(list)
 
     for x in schedule:
-        if not is_na_teacher(x["teacher"]):
-            teacher_map[(x["teacher"], x["day"], x["start"])].append(x)
-        section_map[(x["batch"], x["section"], x["day"], x["start"])].append(x)
+        section_seen[
+            (x["batch"], x["section"], x["day"], x["start"])
+        ].append(x)
+        teacher_seen[
+            (x["teacher"].strip().lower(), x["day"], x["start"])
+        ].append(x)
 
-    for key, items in teacher_map.items():
+    for key, items in section_seen.items():
         if len(items) > 1:
-            out.append(("Teacher clash", key, items))
+            clashes.append(("Section clash", key, items))
 
-    for key, items in section_map.items():
+    for key, items in teacher_seen.items():
         if len(items) > 1:
-            out.append(("Section clash", key, items))
+            clashes.append(("Teacher clash", key, items))
 
-    return out
-
-
-def time_label(start):
-    return f"{start:02d}:00-{start + 1:02d}:00"
+    return clashes
 
 
-def timetable_df(schedule):
-    return pd.DataFrame(
-        [
-            {
-                "Batch": x["batch"],
-                "Section": x["section"],
-                "Day": x["day"],
-                "Start": x["start"],
-                "Time": time_label(x["start"]),
-                "Type": x["type"],
-                "Subject": f'{x["subject"]} ({x["code"]})',
-                "Teacher": x["teacher"] or "Not specified",
-            }
-            for x in schedule
-        ]
-    )
+def schedule_dataframe(schedule):
+    rows = []
+    for x in schedule:
+        rows.append({
+            "Batch": x["batch"],
+            "Section": x["section"],
+            "Day": x["day"],
+            "Start": x["start"],
+            "Time": hour_label(x["start"]),
+            "Type": x["type"],
+            "Subject": x["subject"],
+            "Code": x["code"],
+            "Teacher": x["teacher"],
+            "Fixed": "Yes" if x.get("locked") else "No",
+        })
+    return pd.DataFrame(rows)
 
 
-def make_grid(df, batch, section):
-    data = {"Time": [time_label(h) for h in range(8, 15)]}
-    for day in DAYS:
-        values = []
-        for h in range(8, 15):
+def timetable_grid(schedule, batch, section):
+    rows = []
+    for h in range(8, 15):
+        row = {"Time": hour_label(h)}
+        for day in DAYS:
             if day == "Friday" and h >= 13:
-                values.append("")
+                row[day] = ""
                 continue
 
-            z = df[
-                (df["Batch"] == batch)
-                & (df["Section"] == section)
-                & (df["Day"] == day)
-                & (df["Start"] == h)
+            items = [
+                x for x in schedule
+                if x["batch"] == batch
+                and x["section"] == section
+                and x["day"] == day
+                and x["start"] == h
             ]
-
-            if z.empty:
-                values.append("")
+            if items:
+                x = items[0]
+                prefix = "P: " if x["type"] == "Practical" else ""
+                row[day] = f"{prefix}{x['subject']}\n{x['teacher']}"
             else:
-                r = z.iloc[0]
-                prefix = "🔬 " if r["Type"] == "Practical" else ""
-                values.append(f'{prefix}{r["Subject"]}\n{r["Teacher"]}')
-        data[day] = values
-    return pd.DataFrame(data)
+                row[day] = ""
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
-def export_excel(df):
+def teacher_grid(schedule, teacher):
+    rows = []
+    for h in range(8, 15):
+        row = {"Time": hour_label(h)}
+        for day in DAYS:
+            if day == "Friday" and h >= 13:
+                row[day] = ""
+                continue
+            items = [
+                x for x in schedule
+                if x["teacher"].strip().lower() == teacher.strip().lower()
+                and x["day"] == day
+                and x["start"] == h
+            ]
+            row[day] = (
+                f"{items[0]['batch']}-{items[0]['section']}\n{items[0]['subject']}"
+                if items else ""
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def make_excel(schedule):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Master Timetable"
+
+    title = "Civil Engineering Timetable"
+    ws["A1"] = title
+    ws["A1"].font = Font(size=16, bold=True)
+    ws.merge_cells("A1:J1")
+
+    df = schedule_dataframe(schedule)
+    for c, col in enumerate(df.columns, 1):
+        cell = ws.cell(3, c, col)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.alignment = Alignment(horizontal="center")
+
+    for r_idx, row in enumerate(df.itertuples(index=False), 4):
+        for c_idx, value in enumerate(row, 1):
+            ws.cell(r_idx, c_idx, value)
+
+    thin = Side(style="thin", color="B7B7B7")
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    for i in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 18
+
+    # Batch/section sheets
+    groups = sorted({(x["batch"], x["section"]) for x in schedule})
+    for batch, section in groups:
+        ws2 = wb.create_sheet(f"{batch}-{section}")
+        ws2["A1"] = f"{batch} - Section {section}"
+        ws2["A1"].font = Font(size=14, bold=True)
+        ws2.merge_cells("A1:F1")
+
+        grid = timetable_grid(schedule, batch, section)
+        for c, col in enumerate(grid.columns, 1):
+            cell = ws2.cell(3, c, col)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.alignment = Alignment(horizontal="center")
+
+        for rr, row in enumerate(grid.itertuples(index=False), 4):
+            for cc, value in enumerate(row, 1):
+                ws2.cell(rr, cc, value)
+                ws2.cell(rr, cc).alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=True
+                )
+
+        for c in range(1, ws2.max_column + 1):
+            ws2.column_dimensions[get_column_letter(c)].width = 24
+
+    # Teacher sheets
+    teachers = sorted({x["teacher"] for x in schedule if x["teacher"]})
+    for teacher in teachers:
+        safe = "".join(ch for ch in teacher if ch.isalnum() or ch in " -_")[:25]
+        ws3 = wb.create_sheet(("T-" + safe)[:31])
+        ws3["A1"] = f"Teacher Timetable: {teacher}"
+        ws3["A1"].font = Font(size=13, bold=True)
+        ws3.merge_cells("A1:F1")
+        grid = teacher_grid(schedule, teacher)
+
+        for c, col in enumerate(grid.columns, 1):
+            ws3.cell(3, c, col).font = Font(bold=True)
+            ws3.cell(3, c).fill = PatternFill("solid", fgColor="E2F0D9")
+
+        for rr, row in enumerate(grid.itertuples(index=False), 4):
+            for cc, value in enumerate(row, 1):
+                ws3.cell(rr, cc, value)
+                ws3.cell(rr, cc).alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=True
+                )
+
+        for c in range(1, ws3.max_column + 1):
+            ws3.column_dimensions[get_column_letter(c)].width = 24
+
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="All Classes")
-        for (batch, section), _ in df.groupby(["Batch", "Section"]):
-            sheet = f"{batch}-{section}"[:31]
-            make_grid(df, batch, section).to_excel(writer, index=False, sheet_name=sheet)
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def make_word(schedule):
+    doc = Document()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("DEPARTMENT OF CIVIL ENGINEERING")
+    run.bold = True
+    run.font.size = Pt(16)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("Class Timetable")
+    run.bold = True
+    run.font.size = Pt(14)
+
+    groups = sorted({(x["batch"], x["section"]) for x in schedule})
+
+    for batch, section in groups:
+        doc.add_heading(f"{batch} — Section {section}", level=2)
+        grid = timetable_grid(schedule, batch, section)
+
+        table = doc.add_table(rows=1, cols=len(grid.columns))
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = "Table Grid"
+
+        for i, col in enumerate(grid.columns):
+            cell = table.rows[0].cells[i]
+            cell.text = col
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            for run in cell.paragraphs[0].runs:
+                run.bold = True
+
+        for _, r in grid.iterrows():
+            cells = table.add_row().cells
+            for i, col in enumerate(grid.columns):
+                cells[i].text = str(r[col])
+                cells[i].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+        doc.add_paragraph("")
+
+    bio = io.BytesIO()
+    doc.save(bio)
     return bio.getvalue()
 
 
 # -------------------------------------------------------------------
-# Streamlit UI
+# UI
 # -------------------------------------------------------------------
-st.title("🗓️ Civil Engineering Timetable Planner")
+st.title("📅 CivTime")
+st.subheader("Civil Engineering Timetable Coordinator")
 st.caption(
-    "Upload the subject-allocation sheet in PDF, Word or Excel. "
-    "The app extracts Civil Engineering subjects, maps Theory A-D to Sections A-D, "
-    "and generates a timetable with teacher-clash checking."
+    "Manual subject allocation → optional fixed slots → automatic clash-free timetable → Excel/Word"
 )
 
-with st.sidebar:
-    st.header("Rules")
-    st.write("• Saturday & Sunday: OFF")
-    st.write("• Monday–Thursday: 08:00–15:00")
-    st.write("• Friday: 08:00–13:00")
-    st.write("• Theory = 1-hour periods")
-    st.write("• Practical = one continuous 3-hour block/week")
-    st.write("• No two theory periods of the same subject on one day")
-    st.write("• Manual locked periods are preserved")
-    st.write("• Other-department subjects are excluded")
-    st.write("• Section limit: A, B, C, D")
+if "allocations" not in st.session_state:
+    st.session_state.allocations = empty_allocations()
 
-upload = st.file_uploader(
-    "Upload Subject Allocation File",
-    type=["pdf", "docx", "xlsx", "xls", "xlsm"],
-)
+if "locks" not in st.session_state:
+    st.session_state.locks = empty_locks()
 
-if upload:
-    with st.spinner("Reading and reconstructing the allocation table..."):
-        try:
-            raw = parse_upload(upload)
-            raw = [r for r in raw if is_civil_row(r)]
-        except Exception as e:
-            raw = []
-            st.error(f"Reading error: {e}")
+if "schedule" not in st.session_state:
+    st.session_state.schedule = None
 
-    if not raw:
-        st.error(
-            "No Civil Engineering subject rows were detected. "
-            "Check that the file contains subject codes such as CE411, CE407, etc."
-        )
-        st.stop()
+if "failed" not in st.session_state:
+    st.session_state.failed = []
 
-    st.success(f"{len(raw)} Civil Engineering subject rows detected.")
+tab1, tab2, tab3, tab4 = st.tabs([
+    "1️⃣ Subject Allocation",
+    "2️⃣ Fixed Time Slots",
+    "3️⃣ Generate Timetable",
+    "4️⃣ Results & Download",
+])
 
-    # Review/edit stage is important for complex PDF/Word layouts.
-    review = pd.DataFrame(
-        [
-            {
-                "Batch": r["batch"],
-                "Semester": r["semester"],
-                "Subject": r["subject"],
-                "Code": r["code"],
-                "Theory CH": r["theory_hours"],
-                "Practical CH": r["practical_hours"],
-                "Theory A": r["theory_teachers"][0] if len(r["theory_teachers"]) > 0 else "",
-                "Theory B": r["theory_teachers"][1] if len(r["theory_teachers"]) > 1 else "",
-                "Theory C": r["theory_teachers"][2] if len(r["theory_teachers"]) > 2 else "",
-                "Theory D": r["theory_teachers"][3] if len(r["theory_teachers"]) > 3 else "",
-                "Practical": r["practical_teacher"],
-            }
-            for r in raw
-        ]
-    )
+with tab1:
+    st.markdown("### Enter Subject Allocation")
 
-    st.subheader("1. Extracted allocation — review before scheduling")
     st.info(
-        "This review table is intentional. University allocation files use merged cells, "
-        "multi-line teacher names and different Theory A/B/C/D layouts. You can correct "
-        "any extraction issue here before generating the timetable."
+        "Enter one row for each teaching assignment. "
+        "For a subject with theory and practical, use separate rows. "
+        "Only 25CE currently allows Section D; all other batches use A, B and C."
     )
-    review = st.data_editor(
-        review,
+
+    c1, c2, c3 = st.columns(3)
+    batch = c1.selectbox("Batch", BATCHES)
+    section = c2.selectbox("Section", allowed_sections(batch))
+    typ = c3.selectbox("Type", ["Theory", "Practical"])
+
+    c1, c2, c3, c4 = st.columns(4)
+    subject = c1.text_input("Subject")
+    code = c2.text_input("Subject Code")
+    teacher = c3.text_input("Subject Teacher")
+    ch = c4.number_input(
+        "Credit Hours",
+        min_value=1,
+        max_value=3,
+        value=3 if typ == "Theory" else 1,
+        step=1,
+    )
+
+    if st.button("➕ Add Allocation", type="primary"):
+        new_row = pd.DataFrame([{
+            "Batch": batch,
+            "Section": section,
+            "Subject": subject.strip(),
+            "Code": code.strip().upper(),
+            "Teacher": teacher.strip(),
+            "Type": typ,
+            "CH": int(ch),
+        }])
+
+        if not subject.strip() or not teacher.strip():
+            st.error("Subject and teacher are required.")
+        elif typ == "Practical" and int(ch) != 1:
+            st.error("Practical credit hours must be 1.")
+        else:
+            st.session_state.allocations = pd.concat(
+                [st.session_state.allocations, new_row],
+                ignore_index=True,
+            )
+            st.success("Allocation added.")
+
+    st.markdown("#### Current Saved Allocation")
+    edited = st.data_editor(
+        st.session_state.allocations,
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
-        key="allocation_review",
-    )
-
-    batches = sorted(
-        {
-            canon_batch(x)
-            for x in review["Batch"].tolist()
-            if clean(x)
-        }
-    )
-
-    st.subheader("2. Select batches and sections")
-    c1, c2 = st.columns(2)
-    selected_batches = c1.multiselect("Batches", batches, default=batches)
-
-    available_sections = sorted(
-        {sec for batch in selected_batches for sec in sections_for_batch(batch)},
-        key=lambda x: ["A", "B", "C", "D"].index(x),
-    )
-    selected_sections = c2.multiselect(
-        "Sections",
-        available_sections,
-        default=available_sections,
-        help="A-C are available for all CE batches. Section D is available only for 25CE.",
-    )
-
-    st.subheader("3. Optional manual teacher/time locks")
-    st.caption(
-        "Use this when the timetable coordinator wants a particular teacher/class "
-        "at a fixed time. Automatic scheduling will fill the remaining periods."
-    )
-
-    empty_locks = pd.DataFrame(
-        columns=["Batch", "Section", "Day", "Start", "Subject", "Code", "Teacher", "Type"]
-    )
-    locks_df = st.data_editor(
-        empty_locks,
-        use_container_width=True,
-        num_rows="dynamic",
         column_config={
-            "Batch": st.column_config.SelectboxColumn("Batch", options=selected_batches),
-            "Section": st.column_config.SelectboxColumn("Section", options=available_sections),
-            "Day": st.column_config.SelectboxColumn("Day", options=DAYS),
-            "Start": st.column_config.NumberColumn("Start hour", min_value=8, max_value=14, step=1),
-            "Type": st.column_config.SelectboxColumn("Type", options=["Theory", "Practical"]),
+            "Batch": st.column_config.SelectboxColumn("Batch", options=BATCHES),
+            "Section": st.column_config.SelectboxColumn(
+                "Section", options=ALL_SECTIONS
+            ),
+            "Type": st.column_config.SelectboxColumn(
+                "Type", options=["Theory", "Practical"]
+            ),
+            "CH": st.column_config.NumberColumn("CH", min_value=1, max_value=3),
         },
-        key="manual_locks",
+        key="allocation_editor",
     )
 
-    if st.button("⚙️ Generate Timetable", type="primary"):
-        edited_rows = []
-        for _, r in review.iterrows():
-            edited_rows.append(
-                {
-                    "batch": canon_batch(r["Batch"]),
-                    "semester": r["Semester"],
-                    "subject": clean(r["Subject"]),
-                    "code": clean(r["Code"]).upper(),
-                    "theory_hours": int(r["Theory CH"] or 0),
-                    "practical_hours": int(r["Practical CH"] or 0),
-                    "theory_teachers": [
-                        clean(r["Theory A"]),
-                        clean(r["Theory B"]),
-                        clean(r["Theory C"]),
-                        clean(r["Theory D"]),
-                    ],
-                    "practical_teacher": clean(r["Practical"]),
-                    "other_department": False,
-                }
+    if st.button("💾 Save Allocation Table"):
+        clean_df = normalize_allocations(edited)
+        errors = validate_allocations(edited)
+        if errors:
+            st.error("Please correct these entries:")
+            for e in errors:
+                st.write("•", e)
+        else:
+            st.session_state.allocations = clean_df
+            st.success(
+                f"Saved {len(clean_df)} allocation rows. "
+                "The saved table is now the source used by the scheduler."
             )
 
-        edited_rows = [
-            r for r in edited_rows
-            if r["batch"] in selected_batches and r["code"].startswith("CE")
-        ]
+    if not st.session_state.allocations.empty:
+        if st.button("🗑️ Clear All Allocation"):
+            st.session_state.allocations = empty_allocations()
+            st.session_state.schedule = None
+            st.rerun()
 
-        records = expand_records(edited_rows, selected_sections)
+with tab2:
+    st.markdown("### Fixed / Manual Time Slots")
+    st.write(
+        "Optional: enter classes that the coordinator wants to place at a specific "
+        "day/time. These slots are locked and the automatic scheduler works around them."
+    )
 
-        locks = []
-        for _, r in locks_df.iterrows():
-            batch = canon_batch(r.get("Batch", ""))
-            section = clean(r.get("Section", "")).upper()
-            day = clean(r.get("Day", ""))
-            subject = clean(r.get("Subject", "")) or "Manual class"
-            code = clean(r.get("Code", "")).upper()
-            teacher = clean(r.get("Teacher", ""))
-            typ = clean(r.get("Type", "Theory")) or "Theory"
-            if not batch or not section or not day:
-                continue
+    fixed_batch = st.selectbox("Batch for fixed slot", BATCHES, key="fixed_batch")
+    fixed_section = st.selectbox(
+        "Section for fixed slot",
+        allowed_sections(fixed_batch),
+        key="fixed_section",
+    )
 
-            start = int(r.get("Start", 8) or 8)
-            length = 3 if typ == "Practical" else 1
-            if start + length > (13 if day == "Friday" else 15):
-                st.warning(f"Manual lock {batch}-{section} {day} {start}:00 is outside the allowed time.")
-                continue
+    c1, c2, c3 = st.columns(3)
+    fixed_day = c1.selectbox("Day", DAYS)
+    fixed_start = c2.selectbox(
+        "Start Time",
+        DAY_HOURS[fixed_day],
+        format_func=lambda x: hour_label(x),
+    )
+    fixed_type = c3.selectbox("Type", ["Theory", "Practical"], key="fixed_type")
 
-            for j in range(length):
-                locks.append(
-                    {
-                        "batch": batch,
-                        "section": section,
-                        "subject": subject,
-                        "code": code,
-                        "teacher": teacher,
-                        "type": typ,
-                        "period_no": 1,
-                        "day": day,
-                        "start": start + j,
-                        "end": start + j + 1,
-                    }
-                )
+    c1, c2, c3 = st.columns(3)
+    fixed_subject = c1.text_input("Subject", key="fixed_subject")
+    fixed_code = c2.text_input("Code", key="fixed_code")
+    fixed_teacher = c3.text_input("Teacher", key="fixed_teacher")
 
-        schedule, failed = generate_timetable(records, locks)
-        st.session_state["schedule"] = schedule
-        st.session_state["failed"] = failed
+    if st.button("🔒 Add Fixed Slot"):
+        length = 3 if fixed_type == "Practical" else 1
+        allowed = DAY_HOURS[fixed_day]
+        if not all(h in allowed for h in range(fixed_start, fixed_start + length)):
+            st.error("The practical block does not fit completely in the selected day.")
+        elif not fixed_teacher.strip():
+            st.error("Teacher is required.")
+        else:
+            row = pd.DataFrame([{
+                "Batch": fixed_batch,
+                "Section": fixed_section,
+                "Day": fixed_day,
+                "Start": fixed_start,
+                "Subject": fixed_subject,
+                "Code": fixed_code.upper(),
+                "Teacher": fixed_teacher,
+                "Type": fixed_type,
+            }])
+            st.session_state.locks = pd.concat(
+                [st.session_state.locks, row],
+                ignore_index=True,
+            )
+            st.success("Fixed slot added.")
 
-if "schedule" in st.session_state:
-    schedule = st.session_state["schedule"]
-    failed = st.session_state.get("failed", [])
+    st.data_editor(
+        st.session_state.locks,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="lock_editor",
+    )
 
-    st.subheader("4. Generated timetable")
-    df = timetable_df(schedule)
+    if st.button("💾 Save Fixed Slots"):
+        st.session_state.locks = st.session_state.lock_editor
+        st.success("Fixed slots saved.")
 
-    if failed:
-        st.warning(
-            f"{len(failed)} required period(s) could not be placed. "
-            "This means the current constraints leave no legal slot for those classes."
+with tab3:
+    st.markdown("### Generate Timetable")
+
+    if st.session_state.allocations.empty:
+        st.warning("First enter and save the subject allocation.")
+    else:
+        st.write(
+            f"**Saved allocation rows:** {len(st.session_state.allocations)}"
         )
-        with st.expander("Show unplaced classes"):
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Batch": x["batch"],
-                            "Section": x["section"],
-                            "Subject": x["subject"],
-                            "Code": x["code"],
-                            "Type": x["type"],
-                            "Teacher": x["teacher"],
-                        }
-                        for x in failed
-                    ]
-                ),
-                use_container_width=True,
-            )
+        st.write(
+            "The scheduler will use the saved allocation and fixed slots. "
+            "Saturday and Sunday are automatically excluded."
+        )
 
-    if not df.empty:
-        for batch in sorted(df["Batch"].unique()):
-            for section in sorted(df[df["Batch"] == batch]["Section"].unique()):
-                st.markdown(f"### {batch} — Section {section}")
+        if st.button("🚀 Generate Timetable", type="primary"):
+            alloc = normalize_allocations(st.session_state.allocations)
+            errors = validate_allocations(alloc)
+
+            lock_source = st.session_state.locks.copy()
+            locks, lock_errors = create_manual_locks(lock_source)
+            lock_errors += validate_locks(locks)
+
+            if errors or lock_errors:
+                if errors:
+                    st.error("Allocation errors:")
+                    for e in errors:
+                        st.write("•", e)
+                if lock_errors:
+                    st.error("Fixed-slot errors:")
+                    for e in lock_errors:
+                        st.write("•", e)
+            else:
+                records = records_from_allocations(alloc)
+
+                # Remove records whose teacher is missing after editing.
+                records = [r for r in records if r["teacher"].strip()]
+
+                schedule, failed = generate(records, locks)
+                st.session_state.schedule = schedule
+                st.session_state.failed = failed
+
+                st.success(
+                    f"Timetable generated: {len(schedule)} scheduled periods."
+                )
+                if failed:
+                    st.warning(
+                        f"{len(failed)} required allocation(s)/period(s) could not be placed. "
+                        "See the Results tab for details."
+                    )
+
+with tab4:
+    st.markdown("### Results")
+
+    schedule = st.session_state.schedule
+
+    if schedule is None:
+        st.info("Generate the timetable first.")
+    else:
+        df = schedule_dataframe(schedule)
+
+        clashes = clash_report(schedule)
+        if clashes:
+            st.error(f"{len(clashes)} clash(es) detected.")
+            for typ, key, items in clashes[:20]:
+                st.write(f"• **{typ}:** {key}")
+        else:
+            st.success("✅ No teacher or section clashes detected.")
+
+        if st.session_state.failed:
+            st.warning(
+                f"{len(st.session_state.failed)} required class period(s) could not be scheduled."
+            )
+            failed_df = pd.DataFrame([
+                {
+                    "Batch": x["batch"],
+                    "Section": x["section"],
+                    "Subject": x["subject"],
+                    "Code": x["code"],
+                    "Teacher": x["teacher"],
+                    "Type": x["type"],
+                }
+                for x in st.session_state.failed
+            ])
+            st.dataframe(failed_df, use_container_width=True)
+
+        st.markdown("### Complete Schedule")
+        st.dataframe(
+            df.sort_values(["Batch", "Section", "Day", "Start"]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("### Timetable by Batch / Section")
+        for batch in BATCHES:
+            for section in allowed_sections(batch):
+                st.markdown(f"#### {batch} — Section {section}")
                 st.dataframe(
-                    make_grid(df, batch, section),
+                    timetable_grid(schedule, batch, section),
                     use_container_width=True,
                     hide_index=True,
                 )
 
-        st.download_button(
-            "⬇️ Download Complete Timetable (Excel)",
-            data=export_excel(df),
+        st.markdown("### Downloads")
+        excel_data = make_excel(schedule)
+        word_data = make_word(schedule)
+
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "⬇️ Download Excel",
+            data=excel_data,
             file_name="Civil_Engineering_Timetable.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
-
-        bad = conflicts(schedule)
-        if bad:
-            st.error(f"{len(bad)} clash(es) detected.")
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {"Type": a, "Key": str(b), "Classes": str(c)}
-                        for a, b, c in bad
-                    ]
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.success("✅ No teacher or batch/section time clashes detected.")
+        c2.download_button(
+            "⬇️ Download Word",
+            data=word_data,
+            file_name="Civil_Engineering_Timetable.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
