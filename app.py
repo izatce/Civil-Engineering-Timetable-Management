@@ -622,8 +622,8 @@ def make_word(schedule):
 # -------------------------------------------------------------------
 # UI
 # -------------------------------------------------------------------
-st.title("📅 CivTime")
-st.subheader("Civil Engineering Timetable Coordinator")
+st.title("📅 Civil Engineering Department, MUET Jamshoro")
+st.subheader("Timetable Maker")
 st.caption(
     "Manual subject allocation → optional fixed slots → automatic clash-free timetable → Excel/Word"
 )
