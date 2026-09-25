@@ -14,7 +14,7 @@ from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
 from docx.shared import Inches, Pt
 
 st.set_page_config(
-    page_title="CivTime - Civil Engineering Timetable Coordinator",
+    page_title="Civil Engineering Department, MUET Jamshoro - Timetable Maker",
     page_icon="📅",
     layout="wide",
 )
